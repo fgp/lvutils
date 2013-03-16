@@ -88,8 +88,7 @@ case OPTS::MODE
     LVPEEK_CGROUP = "/" + OPTS::VOLUME_GROUP + "/" + OPTS::LOGICAL_VOLUME + "/" + SNAPSHOT_NAME
 
     # Create snapshot-specific cgroup in lvpeek hierarchy and assign current task.
-    # Register release_agent, which takes care of removing the cgroup and the snapshot
-    # once the snapshot-specific cgroup is empty.
+    # Once the task and all descendents exit, the release_agent will be invoked
     system(*(%w(mount -n -t cgroup -o none,name=lvpeek cgroup) + [LVPEEK_ROOT]))
     File::write(LVPEEK_ROOT + "/release_agent", File.dirname(File.expand_path($PROGRAM_NAME)) + "/lvpeek_release_agent.sh")
     FileUtils.mkdir_p LVPEEK_ROOT + LVPEEK_CGROUP
@@ -97,8 +96,11 @@ case OPTS::MODE
     File::write LVPEEK_ROOT + LVPEEK_CGROUP + "/notify_on_release", "1"
     system(*(%w(umount -n) + [LVPEEK_ROOT]))
     
-    puts File::read("/proc/self/cgroup")
-
+    # Create snapshot
+    system(*%W(lvcreate --snapshot /dev/#{OPTS::VOLUME_GROUP}/#{OPTS::LOGICAL_VOLUME} --name #{SNAPSHOT_NAME} --size #{OPTS::SNAPSHOT_SIZE}M))
+    
+    system("lvs")
+    
  when :cleanup
    VOLUME_GROUP, LOGICAL_VOLUME, SNAPSHOT_NAME = *OPTS::LVPEEK_CGROUP.split(/\//)[1..-1]
 
@@ -106,6 +108,9 @@ case OPTS::MODE
    system(*(%w(mount -n -t cgroup -o none,name=lvpeek cgroup) + [LVPEEK_ROOT]))
    Dir.rmdir LVPEEK_ROOT + OPTS::LVPEEK_CGROUP
    system(*(%w(umount -n) + [LVPEEK_ROOT]))
+   
+   # Remove snapshot
+   system(*%W(lvremove --force #{VOLUME_GROUP}/#{SNAPSHOT_NAME}))
    
    # Log success
    puts "#{Time.now}: Successfully cleaned up #{SNAPSHOT_NAME}"
