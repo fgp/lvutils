@@ -1,0 +1,123 @@
+#!/usr/bin/env ruby
+require 'fileutils'
+require 'tmpdir'
+require 'lvutils/options'
+
+LVPEEK_ROOT = "/var/lvpeek"
+
+OPTIONS = [
+  { :id => "mode",
+    :enabled => proc { true },
+    :default => proc { MODE=:mount }
+  },
+  { :names => %w{--release},
+    :id => "mode",
+    :desc => "Release cgroup and delete snapshot",
+    :enabled => proc { true },
+    :validate => /\A[A-Za-z0-9+_.\/-]+\Z/,
+    :handler => proc { |cg| MODE=:cleanup; LVPEEK_CGROUP=cg }
+  },
+  { :names => %w{-g --volume-group},
+    :id => "volume-group",
+    :desc => "Physical volume group containing the logical volume to inspect",
+    :enabled => proc { MODE == :mount },
+    :validate => /\A[A-Za-z0-9+_.-]+\Z/,
+    :handler => proc { |vg| VOLUME_GROUP=vg }
+  },
+  { :names => %w{-l --logical-volume},
+    :id => "logical-volume",
+    :desc => "Logical volume to inspect",
+    :enabled => proc { MODE == :mount },
+    :validate => /\A[A-Za-z0-9+_.-]+\Z/,
+    :handler => proc { |lv| VOLUME=lv }
+  },
+  { :names => %w{-s --size},
+    :id => "size",
+    :desc => "Snapshot size in MiB (2^20 bytes)",
+    :enabled => proc { MODE == :mount },
+    :validate => /\A[0-9]+\Z/,
+    :handler => proc { |s| SNAPSHOT_SIZE=s },
+    :default => proc { SNAPSHOT_SIZE=1024 }
+  },
+  { :names => %w{-t --format},
+    :id => "format",
+    :desc => "Format of logical volume, required if not autodetected by mount",
+    :enabled => proc { MODE == :mount },
+    :handler => proc { |f| VOLUME_FORMAT=f },
+    :default => proc { VOLUME_FORMAT=nil }
+  },
+  { :names => [:trailing],
+    :id => "command",
+    :desc => "Command to run",
+    :enabled => proc { MODE == :mount },
+    :handler => proc { |*c| COMMAND = c },
+    :default => proc { COMMAND = [ ENV["SHELL"] ] }
+  }
+]
+
+def cmd(cmd, opts = {})
+  r = Kernel::system *cmd, opts
+  raise "#{args.first} failed" unless r
+end
+
+begin
+  # Parse command-line options
+  LVUtils::Options.parse(ARGV, OPTIONS)
+
+  # Create new mount namespace
+  Kernel.syscall(272, 0x00020000) # unshare(CLONE_NEWNS)
+
+  case MODE
+    when :mount
+      # Secure mount point
+      File::chmod(0755, LVPEEK_ROOT)
+      
+      # Create release agent script
+      File::write LVPEEK_ROOT + "/release_agent.sh", <<-eod
+#!/bin/sh
+exec < /dev/null
+exec >> /tmp/lvpeek_release_agent.log
+exec 2>&1
+#{Gem.ruby} -I#{File.dirname(File.dirname($LOADED_FEATURES.find {|f| /lvutils\/error\.rb\Z/ =~ f}))} -- #{File.expand_path($PROGRAM_NAME)} --release "$1"
+      eod
+      File::chmod(0700, LVPEEK_ROOT + "/release_agent.sh")
+      
+      # Create unique snapshot name and determine relative cgroup path
+      SNAPSHOT = Time::now.strftime("lvpeek-%Y%m%d-%H%M%S-") + ("%06d" % rand(1000000))
+      LVPEEK_CGROUP = "/" + VOLUME_GROUP + "/" + VOLUME + "/" + SNAPSHOT
+
+      # Create snapshot-specific cgroup in lvpeek hierarchy and assign current task.
+      # Once the task and all descendents exit, the release_agent will be invoked
+      cmd %W(mount -n -t cgroup -o none,name=lvpeek cgroup #{LVPEEK_ROOT})
+      File::write LVPEEK_ROOT + "/release_agent", LVPEEK_ROOT + "/release_agent.sh"
+      FileUtils.mkdir_p LVPEEK_ROOT + LVPEEK_CGROUP
+      File::write LVPEEK_ROOT + LVPEEK_CGROUP + "/cgroup.procs", "0"
+      File::write LVPEEK_ROOT + LVPEEK_CGROUP + "/notify_on_release", "1"
+      cmd %W(umount -n #{LVPEEK_ROOT})
+      
+      # Create snapshot
+      cmd %W(lvcreate --snapshot /dev/#{VOLUME_GROUP}/#{VOLUME} --name #{SNAPSHOT} --size #{SNAPSHOT_SIZE}M), 1 => "/dev/null"
+
+      # Mount snapshot
+      cmd %W(mount -n /dev/#{VOLUME_GROUP}/#{SNAPSHOT} #{LVPEEK_ROOT} -o ro) + (VOLUME_FORMAT ? %W(-t #{VOLUME_FORMAT}) : [])
+      
+      # Run command
+      Dir.chdir LVPEEK_ROOT
+      Kernel::exec *COMMAND
+      
+   when :cleanup
+     # Determine volume group, volume and snapshot from relative cgroup path
+     VOLUME_GROUP, VOLUME, SNAPSHOT = *LVPEEK_CGROUP.split(/\//)[1..-1]
+
+     # Remove snapshot-specific cgroup
+     cmd %W(mount -n -t cgroup -o none,name=lvpeek cgroup #{LVPEEK_ROOT})
+     Dir.rmdir LVPEEK_ROOT + LVPEEK_CGROUP
+     cmd %W(umount -n #{LVPEEK_ROOT})
+     
+     # Remove snapshot
+     cmd %W(lvremove --force #{VOLUME_GROUP}/#{SNAPSHOT})
+  end
+rescue Exception => e
+  STDERR.puts e.message
+  exit 1
+end
