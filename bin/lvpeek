@@ -7,50 +7,56 @@ LVPEEK_ROOT = "/var/lvpeek"
 
 OPTIONS = [
   { :id => "mode",
-    :enabled => proc { true },
-    :default => proc { MODE=:mount }
+    :mode => :mount,
+    :default => proc {  MODE=:mount }
   },
-  { :names => %w{--release},
+  { :names => %w{-h --help},
+    :id => "mode",
+    :desc => "Show help",
+    :mode => :help,
+    :handler => proc { MODE=:help },
+  },
+  { :names => %w{--cleanup},
     :id => "mode",
     :desc => "Release cgroup and delete snapshot",
-    :enabled => proc { true },
+    :mode => :cleanup,
     :validate => /\A[A-Za-z0-9+_.\/-]+\Z/,
-    :handler => proc { |cg| MODE=:cleanup; LVPEEK_CGROUP=cg }
+    :handler => proc { |cgroup| MODE=:cleanup; LVPEEK_CGROUP=cgroup },
   },
   { :names => %w{-g --volume-group},
     :id => "volume-group",
     :desc => "Physical volume group containing the logical volume to inspect",
-    :enabled => proc { MODE == :mount },
+    :mode => :mount,
     :validate => /\A[A-Za-z0-9+_.-]+\Z/,
-    :handler => proc { |vg| VOLUME_GROUP=vg }
+    :handler => proc { |volume_group| VOLUME_GROUP=volume_group }
   },
   { :names => %w{-l --logical-volume},
     :id => "logical-volume",
     :desc => "Logical volume to inspect",
-    :enabled => proc { MODE == :mount },
+    :mode => :mount,
     :validate => /\A[A-Za-z0-9+_.-]+\Z/,
-    :handler => proc { |lv| VOLUME=lv }
+    :handler => proc { |logical_volume| VOLUME=logical_volume }
   },
   { :names => %w{-s --size},
     :id => "size",
     :desc => "Snapshot size in MiB (2^20 bytes)",
-    :enabled => proc { MODE == :mount },
+    :mode => :mount,
     :validate => /\A[0-9]+\Z/,
-    :handler => proc { |s| SNAPSHOT_SIZE=s },
+    :handler => proc { |size| SNAPSHOT_SIZE=size },
     :default => proc { SNAPSHOT_SIZE=1024 }
   },
   { :names => %w{-t --format},
     :id => "format",
     :desc => "Format of logical volume, required if not autodetected by mount",
-    :enabled => proc { MODE == :mount },
-    :handler => proc { |f| VOLUME_FORMAT=f },
+    :mode => :mount,
+    :handler => proc { |format| VOLUME_FORMAT=format },
     :default => proc { VOLUME_FORMAT=nil }
   },
   { :names => [:trailing],
     :id => "command",
     :desc => "Command to run",
-    :enabled => proc { MODE == :mount },
-    :handler => proc { |*c| COMMAND = c },
+    :mode => :mount,
+    :handler => proc { |*command| COMMAND = command },
     :default => proc { COMMAND = [ ENV["SHELL"] ] }
   }
 ]
@@ -68,6 +74,9 @@ begin
   Kernel.syscall(272, 0x00020000) # unshare(CLONE_NEWNS)
 
   case MODE
+    when :help
+      LVUtils::Options.help(STDOUT, OPTIONS)
+
     when :mount
       # Secure mount point
       File::chmod(0755, LVPEEK_ROOT)
@@ -78,7 +87,7 @@ begin
 exec < /dev/null
 exec >> /tmp/lvpeek_release_agent.log
 exec 2>&1
-#{Gem.ruby} -I#{File.dirname(File.dirname($LOADED_FEATURES.find {|f| /lvutils\/error\.rb\Z/ =~ f}))} -- #{File.expand_path($PROGRAM_NAME)} --release "$1"
+#{Gem.ruby} -I#{File.dirname(File.dirname($LOADED_FEATURES.find {|f| /lvutils\/error\.rb\Z/ =~ f}))} -- #{File.expand_path($PROGRAM_NAME)} --cleanup "$1"
       eod
       File::chmod(0700, LVPEEK_ROOT + "/release_agent.sh")
       
@@ -117,7 +126,7 @@ exec 2>&1
      # Remove snapshot
      cmd %W(lvremove --force #{VOLUME_GROUP}/#{SNAPSHOT})
   end
-rescue Exception => e
+rescue LVUtils::InvalidOption => e
   STDERR.puts e.message
   exit 1
 end
